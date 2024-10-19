@@ -1,388 +1,243 @@
-/-
-Copyright (c) 2020 Markus Himmel. All rights reserved.
-Released under Apache 2.0 license as described in the file LICENSE.
-Authors: Markus Himmel
--/
-import basic
-import tactic.norm_num
-import init.meta.has_reflect
-
-universes u v w
-
-open tactic
-
-def list.mfirst' {m : Type → Type v} [monad m] {α : Type} [inhabited α] (f : α → m bool) : list α → m α
-| [] := return default
-| (a::as) := do
-  r ← f a,
-  if r then return a else list.mfirst' as
-
-def list.mfiltermap {m : Type u → Type v} [monad m] {α : Type w} {β : Type u}
-  (f : α → m (option β)) : list α → m (list β)
-| [] := return []
-| (x::xs) := do
-    y ← f x,
-    r ← list.mfiltermap xs,
-    match y with
-    | none := return r
-    | some z := return (z::r)
-    end
-
-namespace tactic.sudoku
-
-meta def get_sudoku : tactic expr :=
-local_context >>= list.mfirst' (λ t, (do `(sudoku) ← infer_type t, return tt) <|> return ff)
-
-meta structure cell_data :=
-(row col val : fin 9)
-(e re ce ve : expr)
-
-meta structure outer_pencil_data :=
-(row₀ col₀ row₁ col₁ val : fin 9)
-(e : expr)
-
-meta structure inner_pencil_data :=
-(row col : fin 9)
-(vals : list (fin 9))
-(e : expr)
-
-meta structure board_info :=
-(cd : list cell_data)
-(op : list outer_pencil_data)
-(ip : list inner_pencil_data)
-
-meta instance format_cell_data : has_to_format cell_data :=
-{ to_format := λ d,
-  format!"{cell_data.e d}" }
-
-meta def eval_fin : expr → fin 9
-| `(bit1 %%e) := let i := eval_fin e in ⟨(2 * i.1 + 1) % 9, nat.mod_lt _ $ nat.zero_lt_succ _⟩
-| `(bit0 %%e) := let i := eval_fin e in ⟨(2 * i.1) % 9, nat.mod_lt _ $ nat.zero_lt_succ _⟩
-| `(has_one.one) := 1
-| `(has_zero.zero) := 0
-| `(coe %%e) := eval_fin e
-| `(%%e * %%f) := let i := eval_fin e, j := eval_fin f in ⟨(i.1 * j.1) % 9, nat.mod_lt _ $ nat.zero_lt_succ _⟩
-| `(%%e + %%f) := let i := eval_fin e, j := eval_fin f in ⟨(i.1 + j.1) % 9, nat.mod_lt _ $ nat.zero_lt_succ _⟩
-| `(%%e / %%f) := let i := eval_fin e, j := eval_fin f in ⟨(i.1 / j.1) % 9, nat.mod_lt _ $ nat.zero_lt_succ _⟩
-| `(subtype.val %%e) := eval_fin e
-| _ := 0
-
-meta def parse_cell_data (s e : expr) : tactic (option cell_data) :=
-(do
-  `(sudoku.f %%s (%%a, %%b) = %%c) ← infer_type e,
-  let u := eval_fin a,
-  let v := eval_fin b,
-  let w := eval_fin c,
-  return $ some ⟨u, v, w, e, a, b, c⟩) <|> return none
-
-meta def parse_outer_pencil_data (s e : expr) : tactic (option outer_pencil_data) :=
-(do
-  `(sudoku.snyder %%s %%r₀ %%c₀ %%r₁ %%c₁ %%v) ← infer_type e,
-  [pr₀, pc₀, pr₁, pc₁, pv] ← list.mmap (eval_expr (fin 9)) [r₀, c₀, r₁, c₁, v],
-  return $ some ⟨pr₀, pc₀, pr₁, pc₁, pv, e⟩) <|> return none
-
-meta def parse_inner_pencil_data₂ (s e : expr) : tactic (option inner_pencil_data) :=
-(do
-  `(sudoku.double %%s %%r %%c %%v₁ %%v₂) ← infer_type e,
-  [pr, pc, pv₁, pv₂] ← list.mmap (eval_expr (fin 9)) [r, c, v₁, v₂],
-  return $ some ⟨pr, pc, [pv₁, pv₂], e⟩) <|> return none
-
-meta def parse_inner_pencil_data₃ (s e : expr) : tactic (option inner_pencil_data) :=
-(do
-  `(sudoku.triple %%s %%r %%c %%v₁ %%v₂ %%v₃) ← infer_type e,
-  [pr, pc, pv₁, pv₂, pv₃] ← list.mmap (eval_expr (fin 9)) [r, c, v₁, v₂, v₃],
-  return $ some ⟨pr, pc, [pv₁, pv₂, pv₃], e⟩) <|> return none
-
-meta def parse_inner_pencil_data (s e : expr) : tactic (option inner_pencil_data) :=
-do
-  t ← parse_inner_pencil_data₂ s e,
-  match t with
-  | some d := return $ some d
-  | none := parse_inner_pencil_data₃ s e
-  end
-
-meta def get_cell_data (s : expr) : tactic (list cell_data) :=
-local_context >>= list.mfiltermap (parse_cell_data s)
-
-meta def get_outer_pencil_data (s : expr) : tactic (list outer_pencil_data) :=
-local_context >>= list.mfiltermap (parse_outer_pencil_data s)
-
-meta def get_inner_pencil_data (s : expr) : tactic (list inner_pencil_data) :=
-local_context >>= list.mfiltermap (parse_inner_pencil_data s)
-
-meta def get_board_info (s : expr) : tactic board_info :=
-do
-  cd ← get_cell_data s,
-  op ← get_outer_pencil_data s,
-  ip ← get_inner_pencil_data s,
-  return ⟨cd, op, ip⟩
-
-meta def mk_neq (l r : fin 9) : tactic expr :=
-do
-  bla ← to_expr ``(%%(nat.reflect l.val) ≠ %%(nat.reflect r.val)),
-
-  -- Don't try this at home kids
-  (_, `(eq_true_intro %%a)) ← norm_num.eval_ineq bla,
-  return a
-
-meta def mk_app_stupid_aux : expr → list expr → expr
-| s [] := s
-| s (t::ts) := expr.app (mk_app_stupid_aux s ts) t
-
-meta def mk_app_stupid' (s : expr) (ls : list expr) : expr :=
-mk_app_stupid_aux s ls.reverse
-
-meta def mk_app_stupid (n : name) (ls : list expr) : expr :=
-mk_app_stupid' (expr.const n []) ls
-
-meta def nine : tactic expr := to_expr ``(9)
-
-meta def mk_neq' (l r : fin 9) (a b : expr) : tactic expr :=
-do
-  n ← mk_fresh_name,
-  bla ← to_expr ``(%%a ≠ %%b),
-  u ← mk_neq l r, -- u states that l.1 ≠ r.1
-  f ← tactic.assert n bla,
-  h ← mk_fresh_name,
-  e ← tactic.intro h,
-  ni ← nine,
-  let i := mk_app_stupid `fin.veq_of_eq [ni, a, b, e],
-  let j := expr.app u i,
-  tactic.exact j,
-  return f
-
-meta def mk_row_conflict (s : expr) (l r : cell_data) : tactic unit :=
-do
-  guard (l.row = r.row),
-  guard (l.val = r.val),
-  guard (l.col ≠ r.col),
-  f ← mk_neq' l.col r.col l.ce r.ce,
-  tactic.exact (mk_app_stupid `sudoku.row_conflict [s, l.re, l.ce, r.ce, l.ve, l.e, r.e, f])
-
-meta def mk_col_conflict (s : expr) (l r : cell_data) : tactic unit :=
-do
-  guard (l.row ≠ r.row),
-  guard (l.val = r.val),
-  guard (l.col = r.col),
-  f ← mk_neq' l.row r.row l.re r.re,
-  tactic.exact (mk_app_stupid `sudoku.col_conflict [s, l.re, r.re, l.ce, l.ve, l.e, r.e, f])
-
-meta def mk_cell_conflict (s : expr) (l r : cell_data) : tactic unit :=
-do
-  guard (l.row = r.row),
-  guard (l.col = r.col),
-  guard (l.val ≠ r.val),
-  f ← mk_neq' l.val r.val l.ve r.ve,
-  tactic.exact (mk_app_stupid `sudoku.cell_conflict [s, l.re, l.ce, l.ve, r.ve, l.e, r.e, f])
-
-meta def mk_box_conflict (s : expr) (l r : cell_data) : tactic unit :=
-do
-  guard (l.val = r.val),
-  guard (l.row / 3 = r.row / 3),
-  guard (l.col / 3 = r.col / 3),
-  guard (l.row ≠ r.row ∨ l.col ≠ r.col),
-  e₁ ← to_expr ``(sudoku.box_conflict %%s %%l.e %%r.e rfl rfl),
-  (if l.row ≠ r.row then do f ← mk_neq l.row r.row, to_expr ``(%%e₁ (or.inl (λ h, %%f (fin.veq_of_eq h))))
-    else do f ← mk_neq l.col r.col, to_expr ``(%%e₁ (λ h, (or.inr %%f (fin.veq_of_eq h))))) >>= tactic.exact
-
-meta def loop (cd : list cell_data) (f : cell_data → cell_data → tactic unit) : tactic unit :=
-list.mfirst (λ l : cell_data, list.mfirst (λ r : cell_data, f l r) cd) cd
-
-meta def row_conflict (s : expr) (cd : list cell_data) : tactic unit :=
-loop cd $ mk_row_conflict s
-
-meta def col_conflict (s : expr) (cd : list cell_data) : tactic unit :=
-loop cd $ mk_col_conflict s
-
-meta def cell_conflict (s : expr) (cd : list cell_data) : tactic unit :=
-loop cd $ mk_cell_conflict s
-
-meta def box_conflict (s : expr) (cd : list cell_data) : tactic unit :=
-loop cd $ mk_box_conflict s
-
-meta def split_cases (n : name) : tactic unit :=
-tactic.repeat (do
-  e ← get_local n,
-  tactic.cases e [n, n],
-  skip)
-
-meta def box_logic (r c v : pexpr) (n : name) : tactic unit :=
-do
-  s ← get_sudoku,
-  h ← to_expr ``(sudoku.box_cases %%s %%r %%c %%v),
-  note n none h,
-  split_cases n
-
-meta def row_logic (r v : pexpr) (n : name) : tactic unit :=
-do
-  s ← get_sudoku,
-  h ← to_expr ``(sudoku.row_cases %%s %%r %%v),
-  note n none h,
-  split_cases n
-
-meta def col_logic (c v : pexpr) (n : name) : tactic unit :=
-do
-  s ← get_sudoku,
-  h ← to_expr ``(sudoku.col_cases %%s %%c %%v),
-  note n none h,
-  split_cases n
-
-meta def cell_logic (r c : pexpr) (n : name) : tactic unit :=
-do
-  s ← get_sudoku,
-  h ← to_expr ``(sudoku.cell_cases %%s %%r %%c),
-  note n none h,
-  split_cases n
-
-meta def conflict' (s : expr) (cd : list cell_data) : tactic unit :=
-exfalso >> (row_conflict s cd <|> col_conflict s cd <|> cell_conflict s cd <|> box_conflict s cd)
-
-meta def conflict_with (s : expr) (cd : list cell_data) (es : list expr) : tactic unit :=
-do
-  ds ← list.mfiltermap (parse_cell_data s) es,
-  conflict' s (list.append ds cd)
-
-meta def conflict : tactic unit :=
-do
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  conflict' s cd
-
-meta def sudoku_exact (cd : cell_data) (r c v : fin 9) : tactic unit :=
-do
-  guard (r = cd.row),
-  guard (c = cd.col),
-  guard (v = cd.val),
-  tactic.exact cd.e
-
-meta def sudoku_assumption (s : expr) (cd : list cell_data) : tactic unit :=
-do
-  t ← target,
-  match t with
-  | `(sudoku.f %%s (%%r, %%c) = %%v) :=
-    do
-      [pr, pc, pv] ← return $ list.map eval_fin [r, c, v],
-      list.mfirst (λ c : cell_data, sudoku_exact c pr pc pv) cd
-  | `(sudoku.snyder %%s %%r₁ %%c₁ %%r₂ %%c₂ %%v) :=
-    do
-      [pr₁, pc₁, pr₂, pc₂, pv] ← return $ list.map eval_fin [r₁, c₁, r₂, c₂, v],
-      (left >> list.mfirst (λ c : cell_data, sudoku_exact c pr₁ pc₁ pv) cd) <|>
-        (right >> list.mfirst (λ c : cell_data, sudoku_exact c pr₂ pc₂ pv) cd)
-  | `(sudoku.double %%s %%r %%c %%v₁ %%v₂) :=
-    do
-      [pr, pc, pv₁, pv₂] ← return $ list.map eval_fin [r, c, v₁, v₂],
-      (left >> list.mfirst (λ c : cell_data, sudoku_exact c pr pc pv₁) cd) <|>
-        (right >> list.mfirst (λ c : cell_data, sudoku_exact c pr pc pv₂) cd)
-  | `(sudoku.triple %%s %%r %%c %%v₁ %%v₂ %%v₃) :=
-    do
-      [pr, pc, pv₁, pv₂, pv₃] ← return $ list.map eval_fin [r, c, v₁, v₂, v₃],
-      (left >> list.mfirst (λ c : cell_data, sudoku_exact c pr pc pv₁) cd) <|>
-        (right >> left >> list.mfirst (λ c : cell_data, sudoku_exact c pr pc pv₂) cd) <|>
-        (right >> right >> list.mfirst (λ c : cell_data, sudoku_exact c pr pc pv₃) cd)
-  | _ := tactic.split >> skip
-  end
-
-end tactic.sudoku
-
-namespace tactic.interactive
-
-open tactic.sudoku
-
-setup_tactic_parser
-
-meta def conflict : tactic unit :=
-tactic.sudoku.conflict
-
-meta def box_logic' (r c v : parse parser.pexpr) : tactic unit :=
-tactic.sudoku.box_logic r c v `h
-
-meta def row_logic' (r v : parse parser.pexpr) : tactic unit :=
-tactic.sudoku.row_logic r v `h
-
-meta def col_logic' (c v : parse parser.pexpr) : tactic unit :=
-tactic.sudoku.col_logic c v `h
-
-meta def cell_logic' (r c : parse parser.pexpr) : tactic unit :=
-tactic.sudoku.cell_logic r c `h
-
-
-meta def all_conflict (s : expr) (cd : list cell_data) (lems : list name) (ns : list name) : tactic unit :=
-do
-  let resolve_single (ns : list name) : tactic unit := (tactic.all_goals $ tactic.try (do
-    es ← list.mmap get_local ns,
-    tactic.sudoku.conflict_with s cd es <|>
-      (parse_cell_data s es.head >>=
-        (λ d, match d with | some d := sudoku_assumption s [d] | none := failed end))
-      /-tactic.exact (list.head es) <|>
-      (tactic.left >> tactic.exact es.head) <|>
-      (tactic.right >> tactic.exact es.head) <|>
-      (tactic.right >> tactic.left >> tactic.exact es.head) <|>
-      (tactic.right >> tactic.right >> tactic.exact es.head)-/ )) >> skip,
-  resolve_single ns,
-  let idxs := (list.iota lems.length).reverse,
-  list.mmap' (λ i : ℕ, do
-    some n ← return $ lems.nth (i - 1),
-    tactic.all_goals $ tactic.try $ (do e ← get_local n, tactic.cases e [n, n]),
-    tactic.all_goals $ tactic.try $ (do e ← get_local n, tactic.cases e [n, n]),
-    resolve_single ((lems.take i).append ns)) idxs
-
-meta def box_logic (lems : parse with_ident_list) : tactic unit :=
-do
-  t ← target,
-  (r, c, v) ← match t with
-  | `(sudoku.f %%s (%%r, %%c) = %%v) := return (r, c, v)
-  | `(sudoku.snyder %%s %%r₀ %%c₀ %%r₁ %%c₁ %%v) := return (r₀, c₀, v)
-  | _ := tactic.fail "I don't recognize the goal."
-  end,
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  tactic.sudoku.box_logic ``(((%%r).1 / 3 : ℕ)) ``(((%%c).1 / 3 : ℕ)) (pexpr.of_expr v) `h,
-  all_conflict s cd lems [`h]
-
-meta def row_logic : tactic unit :=
-do
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  `(sudoku.f %%s (%%r, %%c) = %%v) ← target,
-  tactic.sudoku.row_logic (pexpr.of_expr r) (pexpr.of_expr v) `h,
-  all_conflict s cd [] [`h]
-
-meta def col_logic : tactic unit :=
-do
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  `(sudoku.f %%s (%%r, %%c) = %%v) ← target,
-  tactic.sudoku.col_logic (pexpr.of_expr c) (pexpr.of_expr v) `h,
-  all_conflict s cd [] [`h]
-
-meta def cell_logic (lems : parse with_ident_list) : tactic unit :=
-do
-  t ← target,
-  (r, c) ← match t with
-  | `(sudoku.f %%s (%%r, %%c) = %%v) := return (r, c)
-  | `(sudoku.double %%s %%r %%c %%v₁ %%v₂) := return (r, c)
-  | `(sudoku.triple %%s %%r %%c %%v₁ %%v₂ %%v₃) := return (r, c)
-  | _ := tactic.fail "I don't recognize the goal"
-  end,
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  tactic.sudoku.cell_logic (pexpr.of_expr r) (pexpr.of_expr c) `h,
-  all_conflict s cd lems [`h]
-
-meta def pencil (lems : parse with_ident_list) : tactic unit :=
-do
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  all_conflict s cd lems []
-
-meta def naked_single : parse with_ident_list → tactic unit :=
-cell_logic
-
-meta def sudoku_finish : tactic unit :=
-do
-  s ← get_sudoku,
-  cd ← get_cell_data s,
-  tactic.repeat $ sudoku_assumption s cd
-
-
-end tactic.interactive
+import LeanSudoku.Basic
+
+set_option relaxedAutoImplicit false
+
+-- def List.mfirst' {M : Type → Type v} [Monad M] {α : Type} [Inhabited α] (f : α → M Bool) : List α → M α
+-- | [] => return default
+-- | (a::as) => do
+--   let r ← f a
+--   if r then return a else List.mfirst' f as
+
+-- def List.mfiltermap {M : Type u → Type v} [Monad M] {α : Type w} {β : Type u}
+--   (f : α → M (Option β)) : List α → M (List β) := sorry
+
+-- | [] := return []
+-- | (x::xs) := do
+--     y ← f x,
+--     r ← list.mfiltermap xs,
+--     match y with
+--     | none := return r
+--     | some z := return (z::r)
+--     end
+
+def Lean.LocalContext.toList (ctx : Lean.LocalContext) : List Lean.LocalDecl :=
+  ctx.foldr List.cons []
+namespace Tactic.Sudoku
+
+open Lean Meta Elab Tactic
+open scoped Qq
+
+def getSudoku : MetaM Q(Sudoku) := do
+  let lctx ← getLCtx
+  let board? ← lctx.findDeclM? fun decl ↦ do
+    let ⟨1, ~q(Sudoku), ~q($s)⟩ ← Qq.inferTypeQ decl.toExpr | return none
+    return some s
+  match board? with
+  | some board => return board
+  | none => throwError m!"could not find sudoku variable"
+
+structure CellData where
+  (row col val : Fin 9)
+  (e : Expr) (re ce ve : Q(Fin 9))
+  (hr hc hv : Expr)
+
+instance : ToMessageData CellData where
+  toMessageData | {row, col, val, e, ..} => m!"({e} : s.f ({row}, {col}) = {val})"
+
+example : 1 = 1 := by ring
+
+structure OuterPencilData where
+  (row₀ col₀ row₁ col₁ val : Fin 9)
+  (e : Expr)
+
+structure InnerPencilData where
+  (row col : Fin 9)
+  (vals : List (Fin 9))
+  (e : Expr)
+
+structure BoardInfo where
+  (cd : List CellData)
+  (op : List OuterPencilData)
+  (ip : List InnerPencilData)
+
+-- instance : has_to_format cell_data
+
+-- Evaluates an expression `e` of type `Fin 9` to a numeral
+-- and then returns the result `n` along with an expression proving that
+-- `e = ($(mkNatLit n) : Fin 9)`.
+def evalFin (e : Q(Fin 9)) : MetaM (Option (Fin 9 × Expr)) := do
+  let ⟨natLit, proof⟩ ← Mathlib.Meta.NormNum.deriveNat e (q(Fin.instAddMonoidWithOne 9))
+  let some n ← getNatValue? natLit | return none
+  return some ((n : Fin 9), proof)
+
+def parseCellData (s : Q(Sudoku)) (e : Expr) : MetaM (Option CellData) := do
+  let ⟨0, ~q(Sudoku.f $s' ($er, $ec) = $ev), e⟩ ← Qq.inferTypeQ e | return none
+  -- TODO: add a check that `s = s'`? e.g.
+  -- `guard (← isDefEq s s')`
+  let some (r, hr) ← evalFin er | return none
+  let some (c, hc) ← evalFin ec | return none
+  let some (v, hv) ← evalFin ev | return none
+  return some ⟨r, c, v, e, er, ec, ev, hr, hc, hv⟩
+
+def parseOuterPencilData (s : Q(Sudoku)) (e : Expr) : MetaM (Option OuterPencilData) := do
+  let ⟨0, ~q(Sudoku.snyder $s' $er₀ $ec₀ $er₁ $ec₁ $ev), e⟩ ← Qq.inferTypeQ e | return none
+  -- TODO: add a check that `s = s'`?
+  let some (r₀, _) ← evalFin er₀ | return none
+  let some (c₀, _) ← evalFin ec₀ | return none
+  let some (r₁, _) ← evalFin er₁ | return none
+  let some (c₁, _) ← evalFin ec₁ | return none
+  let some (v, _) ← evalFin ev | return none
+  return some ⟨r₀, c₀, r₁, c₁, v, e⟩
+
+def parseInnerPencilData₂ (s : Q(Sudoku)) (e : Expr) : MetaM (Option InnerPencilData) := do
+  let ⟨0, ~q(Sudoku.double $s' $er $ec $ev₁ $ev₂), e⟩ ← Qq.inferTypeQ e | return none
+  -- TODO: add a check that `s = s'`?
+  let some (r, _) ← evalFin er | return none
+  let some (c, _) ← evalFin ec | return none
+  let some (v₁, _) ← evalFin ev₁ | return none
+  let some (v₂, _) ← evalFin ev₂ | return none
+  return some ⟨r, c, [v₁, v₂], e⟩
+
+def parseInnerPencilData₃ (s : Q(Sudoku)) (e : Expr) : MetaM (Option InnerPencilData) := do
+  let ⟨0, ~q(Sudoku.triple $s' $er $ec $ev₁ $ev₂ $ev₃), e⟩ ← Qq.inferTypeQ e | return none
+  -- TODO: add a check that `s = s'`?
+  let some (r, _) ← evalFin er | return none
+  let some (c, _) ← evalFin ec | return none
+  let some (v₁, _) ← evalFin ev₁ | return none
+  let some (v₂, _) ← evalFin ev₂ | return none
+  let some (v₃, _) ← evalFin ev₃ | return none
+  return some ⟨r, c, [v₁, v₂, v₃], e⟩
+
+def parseInnerPencilData (s : Q(Sudoku)) (e : Expr) : MetaM (Option InnerPencilData) := do
+  match ← parseInnerPencilData₂ s e with
+  | some d => return some d
+  | none => parseInnerPencilData₃ s e
+
+def getCellData (s : Q(Sudoku)) : MetaM (List CellData) := do
+  let lCtx ← getLCtx
+  lCtx.toList.filterMapM fun decl => parseCellData s decl.toExpr
+
+def getOuterPencilData (s : Q(Sudoku)) : MetaM (List OuterPencilData) := do
+  let lCtx ← getLCtx
+  lCtx.toList.filterMapM fun decl => parseOuterPencilData s decl.toExpr
+
+def getInnerPencilData (s : Q(Sudoku)) : MetaM (List InnerPencilData) := do
+  let lCtx ← getLCtx
+  lCtx.toList.filterMapM fun decl => parseInnerPencilData s decl.toExpr
+
+def getBoardInfo (s : Q(Sudoku)) : MetaM BoardInfo := do
+  let cellData ← getCellData s
+  let outerPencilData ← getOuterPencilData s
+  let innerPencilData ← getInnerPencilData s
+  return ⟨cellData, outerPencilData, innerPencilData⟩
+
+theorem Fin.ne_of_mod_ne {i j : Fin 9} {n m : Nat}
+    (hi : i = ↑n) (hj : j = ↑m) (h : n % 9 ≠ m % 9) : i ≠ j := by
+  apply Fin.ne_of_val_ne
+  simpa [hi, hj]
+
+def showByNormNum (goal : Q(Prop)) : MetaM Q($goal) := do
+  let mvarId ← mkFreshMVarId
+  let newGoal ← mkFreshExprMVarWithId mvarId (some goal)
+  let .none ← Mathlib.Meta.NormNum.normNumAt mvarId {} #[]
+    | throwError "bug in Tactic.Sudoku: norm_num failed to prove definitional equality"
+  return newGoal
+
+def mkRowConflict (s : Q(Sudoku)) (l r : CellData) : MetaM Q(False) := do
+  logInfo m!"mkRowConflict {l} {r} {l.ce} {r.ce}"
+  guard (l.row = r.row)
+  guard (l.val = r.val)
+  guard (l.col ≠ r.col)
+  let neProof ← showByNormNum q($l.ce % 9 ≠ $r.ce % 9)
+  let le : Q(Sudoku.f $s ($l.re, $l.ce) = $l.ve) := l.e
+  let re : Q(Sudoku.f $s ($l.re, $r.ce) = $l.ve) := r.e
+  let lcLit : Q(ℕ) := mkNatLit l.col
+  let rcLit : Q(ℕ) := mkNatLit r.col
+  let lhc : Q($lcLit = $l.ce) := l.hc
+  let rhc : Q($rcLit = $r.ce) := r.hc
+  return q(Sudoku.row_conflict $s $le $re (Fin.ne_of_mod_ne lhc rhc $neProof))
+
+def mkColConflict (s : Q(Sudoku)) (l r : CellData) : MetaM Q(False) := do
+  guard (l.row ≠ r.row)
+  guard (l.val = r.val)
+  guard (l.col = r.col)
+  let neProof ← showByNormNum q($l.re ≠ $r.re)
+  let le : Q(Sudoku.f $s ($l.re, $l.ce) = $l.ve) := l.e
+  let re : Q(Sudoku.f $s ($r.re, $l.ce) = $l.ve) := r.e
+  return q(Sudoku.col_conflict $s $le $re $neProof)
+
+def mkCellConflict (s : Q(Sudoku)) (l r : CellData) : MetaM Q(False) := do
+  logInfo m!"mkCellConflict {l} {r}"
+  guard (l.row = r.row)
+  guard (l.val ≠ r.val)
+  guard (l.col = r.col)
+  let neProof ← showByNormNum q($l.ve ≠ $r.ve)
+  let le : Q(Sudoku.f $s ($l.re, $l.ce) = $l.ve) := l.e
+  let re : Q(Sudoku.f $s ($l.re, $l.ce) = $r.ve) := r.e
+  return q(Sudoku.cell_conflict $s $le $re $neProof)
+
+def mkBoxConflict (s : Q(Sudoku)) (l r : CellData) : MetaM Q(False) := do
+  guard (l.val = r.val)
+  guard (l.row / 3 = r.row / 3)
+  guard (l.col / 3 = r.col / 3)
+  guard (l.row ≠ r.row ∨ l.col ≠ r.col)
+
+  let rowEqProof ← showByNormNum q(($l.re : Nat) / 3 = $r.re / 3)
+  let colEqProof ← showByNormNum q(($l.ce : Nat) / 3 = $r.ce / 3)
+
+  let orProof ← if l.row ≠ r.row then
+    let neProof ← showByNormNum q($l.re ≠ $r.re)
+    pure <| show Q($l.re ≠ $r.re ∨ $l.ce ≠ $r.ce) from q(Or.inl $neProof)
+  else
+    let neProof ← showByNormNum q($l.ce ≠ $r.ce)
+    pure <| show Q($l.re ≠ $r.re ∨ $l.ce ≠ $r.ce) from q(Or.inr $neProof)
+
+  let le : Q(Sudoku.f $s ($l.re, $l.ce) = $l.ve) := l.e
+  let re : Q(Sudoku.f $s ($r.re, $r.ce) = $l.ve) := r.e
+  return q(Sudoku.box_conflict $s $le $re $rowEqProof $colEqProof $orProof)
+
+#check Sudoku.box_cases
+
+-- Tries `f` on all pairs of values in `l`, returning upon the first success.
+def _root_.List.firstPairM [Alternative m] (l : List α) (f : α → α → m β) : m β :=
+  match l with
+  | (x :: y :: _) => f x y
+  | _ => failure
+  -- f l[0]! l[1]!
+  -- l.firstM fun left => l.firstM fun right => f left right
+
+def rowConflict (s : Q(Sudoku)) (cd : List CellData) : MetaM Q(False) :=
+  cd.firstPairM (mkRowConflict s)
+
+def colConflict (s : Q(Sudoku)) (cd : List CellData) : MetaM Q(False) :=
+  cd.firstPairM (mkColConflict s)
+
+def cellConflict (s : Q(Sudoku)) (cd : List CellData) : MetaM Q(False) := do
+  logInfo "in cellConflict"
+  cd.firstPairM (mkCellConflict s)
+
+def boxConflict (s : Q(Sudoku)) (cd : List CellData) : MetaM Q(False) :=
+  cd.firstPairM (mkBoxConflict s)
+
+def conflict : TacticM Unit :=
+  liftMetaFinishingTactic fun goal => do
+    let s ← getSudoku
+    let cd ← getCellData s
+    logInfo m!"cellData: {cd}"
+    let falseGoal ← goal.exfalso
+    logInfo "after exfalos"
+    let proof ← rowConflict s cd -- <|> colConflict s cd <|> cellConflict s cd <|> boxConflict s cd
+    falseGoal.assign proof
+
+elab "sudoku_conflict" : tactic => conflict
+
+example (s : Sudoku) (h1 : s.f (1, 1) = 1) (h2 : s.f (1, 2) = 1) : False := by
+  sudoku_conflict
+
+elab "my_norm_num" : tactic =>
+  liftMetaFinishingTactic fun goal => do goal.assign (← showByNormNum (← goal.getType))
+
+example : (1 : Fin 9) ≠ 2 := by apply Fin.ne_of_val_ne; simp only [Fin.isValue, Fin.val_one,
+  Fin.val_two, ne_eq, OfNat.one_ne_ofNat, not_false_eq_true]
+
+end Tactic.Sudoku
